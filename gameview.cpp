@@ -7,7 +7,6 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QApplication>
-#include <QtConcurrent/QtConcurrentRun>
 
 GameView::GameView(const QString &characterName, QWidget *parent)
     : QGraphicsView(parent),
@@ -37,12 +36,6 @@ GameView::GameView(const QString &characterName, QWidget *parent)
     m_loader = new LoadingOverlay(this);
     QString base = QCoreApplication::applicationDirPath();
     m_loader->setGif(base + "/texture/loading_screen/loading-pixel.gif");
-
-    connect(&m_mazeWatcher,
-            &QFutureWatcher<MazeGenerator::MazeData>::finished,
-            this,
-            &GameView::onMazeGenerated);
-
     loadNextLevel();
 
     if (m_player)
@@ -69,22 +62,14 @@ void GameView::loadNextLevel()
     // Let UI draw the GIF immediately
     QApplication::processEvents();
 
-    // Start maze generation in a background thread
-    auto future = QtConcurrent::run([rows = m_rowsCells, cols = m_colsCells]() {
-        MazeGenerator gen(rows, cols);
-        return gen.generate();    // returns MazeGenerator::MazeData
-    });
-
-    m_mazeWatcher.setFuture(future);
+    // After a short delay, actually build the maze.
+    QTimer::singleShot(500, this, &GameView::finishLoadNextLevel);
 }
 
-void GameView::onMazeGenerated()
+void GameView::finishLoadNextLevel()
 {
-    // Get the result from the background thread
-    MazeGenerator::MazeData maze = m_mazeWatcher.result();
-
-    // Build the maze on the GUI thread
-    buildMaze(maze);
+    // Build a fresh maze (this will reset player, doors, keys, etc.)
+    buildMaze();
 
     // Hide GIF overlay
     if (m_loader) {
@@ -98,7 +83,7 @@ void GameView::onMazeGenerated()
     m_isLoading = false;
 }
 
-void GameView::buildMaze(const MazeGenerator::MazeData &maze)
+void GameView::buildMaze()
 {
     m_scene->clear();
     m_player   = nullptr;
@@ -110,6 +95,10 @@ void GameView::buildMaze(const MazeGenerator::MazeData &maze)
                                      base + "/texture/walls/");
     m_floorSet = loadRandomTextureSet(floorFamilies(), m_cellSize,
                                       base + "/texture/floor/");
+
+    // Generate maze data (grid + start + exit + doors + keys)
+    MazeGenerator gen(m_rowsCells, m_colsCells);
+    MazeGenerator::MazeData maze = gen.generate();
 
     const auto &grid = maze.grid;
     int gridRows = static_cast<int>(grid.size());
@@ -362,7 +351,7 @@ bool GameView::tryMovePlayer(const QPointF &delta)
     QPainterPath feetPath;
     feetPath.addRect(feetScene);
 
-    const QList<QGraphicsItem*> items = m_scene->items(
+    QList<QGraphicsItem*> items = m_scene->items(
         feetPath,
         Qt::IntersectsItemShape,
         Qt::DescendingOrder,
