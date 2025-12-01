@@ -126,7 +126,6 @@ void GameView::buildMaze(const MazeGenerator::MazeData &maze)
 
     // --- Draw floor tiles for all walkable cells ---
     for (int r = 0; r < gridRows; ++r) {
-        QApplication::processEvents(QEventLoop::AllEvents, 5);
         for (int c = 0; c < gridCols; ++c) {
             if (grid[r][c] == 1)
                 continue; // wall, handled later
@@ -151,7 +150,6 @@ void GameView::buildMaze(const MazeGenerator::MazeData &maze)
 
     // Draw walls only
     for (int r = 0; r < gridRows; ++r) {
-        QApplication::processEvents(QEventLoop::AllEvents, 5);
         for (int c = 0; c < gridCols; ++c) {
             if (grid[r][c] != 1)
                 continue;
@@ -364,7 +362,7 @@ bool GameView::tryMovePlayer(const QPointF &delta)
     QPainterPath feetPath;
     feetPath.addRect(feetScene);
 
-    QList<QGraphicsItem*> items = m_scene->items(
+    const QList<QGraphicsItem*> items = m_scene->items(
         feetPath,
         Qt::IntersectsItemShape,
         Qt::DescendingOrder,
