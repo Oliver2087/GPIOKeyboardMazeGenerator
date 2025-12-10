@@ -7,6 +7,8 @@
 #include <QCoreApplication>
 #include <QDir>
 #include <QApplication>
+#include <QLineF>
+#include <QDebug>
 
 GameView::GameView(const QString &characterName, QWidget *parent)
     : QGraphicsView(parent),
@@ -36,6 +38,8 @@ GameView::GameView(const QString &characterName, QWidget *parent)
     m_loader = new LoadingOverlay(this);
     QString base = QCoreApplication::applicationDirPath();
     m_loader->setGif(base + "/texture/loading_screen/loading-pixel.gif");
+    m_loader->setGeometry(rect());
+    m_loader->hide();
     loadNextLevel();
 
     if (m_player)
@@ -45,6 +49,17 @@ GameView::GameView(const QString &characterName, QWidget *parent)
     connect(&m_moveTimer, &QTimer::timeout, this, &GameView::stepMovement);
     m_moveTimer.setInterval(16); // ms (approx 60 FPS)
     m_moveTimer.start();
+
+    // Monster AI updates every 30ms (~33 FPS), and also refreshes player HP bar
+    connect(&m_monsterAITimer, &QTimer::timeout, this, [this]() {
+        if (!m_player)
+            return;
+        updateMonsters();      // Monster pathfinding + attacks
+        updatePlayerHpBar();   // HP bar follows player
+        ++m_tickCount;         // Controls monster attack timing
+    });
+    m_monsterAITimer.setInterval(30);
+    m_monsterAITimer.start();
 }
 
 void GameView::loadNextLevel()
@@ -54,24 +69,23 @@ void GameView::loadNextLevel()
 
     m_isLoading = true;
 
+    // Stop monster AI to avoid accessing deleted monsters
+    m_monsterAITimer.stop();
+
     // Show GIF overlay
     if (m_loader) {
         m_loader->showOverlay();
     }
 
-    // Let UI draw the GIF immediately
     QApplication::processEvents();
 
-    // After a short delay, actually build the maze.
     QTimer::singleShot(500, this, &GameView::finishLoadNextLevel);
 }
 
 void GameView::finishLoadNextLevel()
 {
-    // Build a fresh maze (this will reset player, doors, keys, etc.)
     buildMaze();
 
-    // Hide GIF overlay
     if (m_loader) {
         m_loader->hideOverlay();
     }
@@ -79,6 +93,9 @@ void GameView::finishLoadNextLevel()
     if (m_player) {
         centerOn(m_player);
     }
+
+    // Restart monster AI
+    m_monsterAITimer.start();
 
     m_isLoading = false;
 }
@@ -90,6 +107,14 @@ void GameView::buildMaze()
     m_exitTile = nullptr;
     m_doors.clear();
 
+    // ---- Reset state (scene already cleared all items) ----
+    m_monsters.clear();       // Only clear container; do not manually delete
+    m_walkableCells.clear();
+    m_monstersSpawned = false;
+    m_playerHp        = m_playerMaxHp;
+    m_playerSlowed    = false;
+    m_tickCount       = 0;
+
     QString base = QCoreApplication::applicationDirPath();
     m_wallSet  = loadRandomTextureSet(wallFamilies(),  m_cellSize,
                                      base + "/texture/walls/");
@@ -99,6 +124,9 @@ void GameView::buildMaze()
     // Generate maze data (grid + start + exit + doors + keys)
     MazeGenerator gen(m_rowsCells, m_colsCells);
     MazeGenerator::MazeData maze = gen.generate();
+
+    // Save a copy of maze grid for monster collision (1 = wall)
+    m_grid = maze.grid;
 
     const auto &grid = maze.grid;
     int gridRows = static_cast<int>(grid.size());
@@ -117,7 +145,10 @@ void GameView::buildMaze()
     for (int r = 0; r < gridRows; ++r) {
         for (int c = 0; c < gridCols; ++c) {
             if (grid[r][c] == 1)
-                continue; // wall, handled later
+                continue;
+
+            // Record all "non-wall" cells; later used for random monster spawn
+            m_walkableCells.append(QPoint(c, r));
 
             int x = c * m_cellSize;
             int y = r * m_cellSize;
@@ -132,7 +163,7 @@ void GameView::buildMaze()
                 QPen(Qt::NoPen),
                 brush
                 );
-            floor->setZValue(-2);        // behind everything else
+            floor->setZValue(-2);  // behind everything
             floor->setData(0, "floor");
         }
     }
@@ -161,7 +192,7 @@ void GameView::buildMaze()
         }
     }
 
-    // Draw EXIT (2x2 block around exit cell for visibility)
+    // Draw EXIT (2x2 block)
     {
         int exitX = maze.exit.c * m_cellSize;
         int exitY = maze.exit.r * m_cellSize;
@@ -173,10 +204,8 @@ void GameView::buildMaze()
         int exitH = cellScale * m_cellSize;
 
         if (!exitTex.isNull()) {
-            // Scale stair texture to exactly fill the 2×2 exit region
             QPixmap scaledExit = exitTex.scaled(
-                exitW,
-                exitH,
+                exitW, exitH,
                 Qt::KeepAspectRatioByExpanding,
                 Qt::SmoothTransformation
                 );
@@ -190,7 +219,7 @@ void GameView::buildMaze()
         }
     }
 
-    // Draw DOORS as 2x2 blocks using maze.doors
+    // Draw doors
     for (int i = 0; i < static_cast<int>(maze.doors.size()); ++i) {
         MazeGenerator::Cell d = maze.doors[i];
         int doorX = d.c * m_cellSize;
@@ -201,53 +230,47 @@ void GameView::buildMaze()
         int doorW = cellScale * m_cellSize;
         int doorH = cellScale * m_cellSize;
 
-        // Scale door so it fits 2x2 cells nicely
         QPixmap scaledDoor = doorTex.scaled(
-            doorW,
-            doorH,
+            doorW, doorH,
             Qt::KeepAspectRatioByExpanding,
             Qt::SmoothTransformation
             );
 
         auto *doorItem = m_scene->addPixmap(scaledDoor);
         doorItem->setPos(doorX, doorY);
-
         doorItem->setData(0, "door");
-        doorItem->setData(1, false);
+        doorItem->setData(1, false);   // locked
         doorItem->setZValue(0);
         m_doors.push_back(doorItem);
     }
 
-    // Draw KEYS (one per door) using maze.keys
+    // Draw keys
     for (int i = 0; i < static_cast<int>(maze.keys.size()); ++i) {
         MazeGenerator::Cell k = maze.keys[i];
         QPixmap keyTex(base + "/texture/keys/key.png");
         if (!keyTex.isNull())
         {
-            int keyWidth  = m_cellSize * 0.8;   // 80% of tile width
-            int keyHeight = m_cellSize * 1.2;   // slightly taller than tile
+            int keyWidth  = m_cellSize * 0.8;
+            int keyHeight = m_cellSize * 1.2;
 
-            // Scale the texture
             QPixmap scaledKey = keyTex.scaled(
-                keyWidth,
-                keyHeight,
+                keyWidth, keyHeight,
                 Qt::KeepAspectRatio,
                 Qt::SmoothTransformation
                 );
 
-            // Center inside the cell
             int keyX = k.c * m_cellSize + (m_cellSize - scaledKey.width()) / 2;
             int keyY = k.r * m_cellSize + (m_cellSize - scaledKey.height()) / 2;
 
             auto *keyItem = m_scene->addPixmap(scaledKey);
             keyItem->setPos(keyX, keyY);
             keyItem->setData(0, "key");
-            keyItem->setData(1, i);       // which door
-            keyItem->setZValue(1);        // above everything
+            keyItem->setData(1, i);       // door index
+            keyItem->setZValue(1);
         }
     }
 
-    // Create player at START
+    // Create player
     QString chosenCharacter = m_characterName;
     QDir appDir(QCoreApplication::applicationDirPath());
     QString spriteRoot = appDir.filePath("characters/" + chosenCharacter);
@@ -255,7 +278,24 @@ void GameView::buildMaze()
     m_player = new PlayerItem(spriteRoot, m_cellSize);
     m_scene->addItem(m_player);
 
-    // Position player so its center is in the start cell
+    // ---- Create HP bar above the player's head ----
+    m_playerHpBg = new QGraphicsRectItem();
+    m_playerHpFg = new QGraphicsRectItem();
+
+    m_playerHpBg->setBrush(Qt::red);
+    m_playerHpBg->setPen(Qt::NoPen);
+    m_playerHpFg->setBrush(Qt::green);
+    m_playerHpFg->setPen(Qt::NoPen);
+
+    m_playerHpBg->setZValue(9999);
+    m_playerHpFg->setZValue(10000);
+
+    m_scene->addItem(m_playerHpBg);
+    m_scene->addItem(m_playerHpFg);
+
+    updatePlayerHpBar();
+
+    // Position player at start cell
     qreal px = maze.start.c * m_cellSize + m_cellSize / 2.0;
     qreal py = maze.start.r * m_cellSize + m_cellSize / 2.0;
 
@@ -267,8 +307,36 @@ void GameView::buildMaze()
     m_controller.setPlayer(m_player);
     m_controller.setStep(m_step);
 #if CONTROL == GPIO
-    m_controller.setGpios(67, 68, 44, 26);
+    m_controller.setGpios(67, 68, 44, 26, 46);
+
+    connect(&m_controller,
+            &GpioController::attackTriggered,
+            this,
+            &GameView::resolvePlayerAttack);
 #endif
+}
+
+void GameView::updatePlayerHpBar()
+{
+    if (!m_player || !m_playerHpBg || !m_playerHpFg)
+        return;
+
+    QRectF pb = m_player->boundingRect();
+
+    // Center-top of player (scene coordinates)
+    QPointF topCenter = m_player->mapToScene(
+        QPointF(pb.center().x(), pb.top())
+        );
+
+    qreal w = m_cellSize * 1.0;
+    qreal h = 6.0;
+
+    QPointF pos(topCenter.x() - w/2.0, topCenter.y() - h - 8);
+
+    m_playerHpBg->setRect(pos.x(), pos.y(), w, h);
+
+    qreal ratio = qMax(0.0, (double)m_playerHp / m_playerMaxHp);
+    m_playerHpFg->setRect(pos.x(), pos.y(), w * ratio, h);
 }
 
 void GameView::keyPressEvent(QKeyEvent *event)
@@ -284,7 +352,11 @@ void GameView::keyPressEvent(QKeyEvent *event)
         return;
     }
 
-    // Start timer when movement begins
+    // If attack key (space), immediately resolve melee attack
+    if (event->key() == Qt::Key_Space) {
+        resolvePlayerAttack();
+    }
+
     if (m_controller.isMoving() && !m_moveTimer.isActive())
         m_moveTimer.start();
 }
@@ -302,7 +374,6 @@ void GameView::keyReleaseEvent(QKeyEvent *event)
         return;
     }
 
-    // Stop timer when no direction is held
     if (!m_controller.isMoving()) {
         m_moveTimer.stop();
     }
@@ -317,7 +388,9 @@ void GameView::stepMovement()
     if (delta.isNull())
         return;
 
+    // Only process player movement; monster AI runs in separate timer
     tryMovePlayer(delta);
+    updatePlayerHpBar();
 }
 
 bool GameView::tryMovePlayer(const QPointF &delta)
@@ -329,7 +402,6 @@ bool GameView::tryMovePlayer(const QPointF &delta)
 
     m_player->setPos(newPos);
 
-    // 1-tile feet collider, independent of sprite height
     QRectF spriteLocal = m_player->boundingRect();
     QPointF bottomCenterLocal(
         spriteLocal.center().x(),
@@ -337,13 +409,13 @@ bool GameView::tryMovePlayer(const QPointF &delta)
         );
     QPointF bottomCenterScene = m_player->mapToScene(bottomCenterLocal);
 
-    // --- FEET HITBOX: small box at the bottom ---
-    qreal hitHeight = m_cellSize * 0.6;   // 60% of a tile height
-    qreal hitWidth  = m_cellSize * 0.6;    // a bit narrower than a tile
+    // ---- Feet collision box ----
+    qreal hitHeight = m_cellSize * 0.6;
+    qreal hitWidth  = m_cellSize * 0.6;
 
     QRectF feetScene(
-        bottomCenterScene.x() - hitWidth / 2.0,   // center horizontally
-        bottomCenterScene.y() - hitHeight - 13.0,        // just above the feet
+        bottomCenterScene.x() - hitWidth / 2.0,
+        bottomCenterScene.y() - hitHeight - 13.0,
         hitWidth,
         hitHeight
         );
@@ -374,19 +446,16 @@ bool GameView::tryMovePlayer(const QPointF &delta)
         } else if (tag == "key") {
             int doorIndex = item->data(1).toInt();
 
-            // Valid door index?
             if (doorIndex >= 0 && doorIndex < static_cast<int>(m_doors.size())) {
 
                 QGraphicsPixmapItem *door = m_doors[doorIndex];
-                door->setData(1, true);        // mark unlocked
+                door->setData(1, true);  // unlocked
 
-                // Load open door texture
                 QString base = QCoreApplication::applicationDirPath();
                 QString openPath = base + "/texture/doors/open/dngn_open_door.png";
                 QPixmap openTex(openPath);
 
                 if (!openTex.isNull()) {
-                    // Scale open door image to match original size
                     openTex = openTex.scaled(
                         door->boundingRect().width(),
                         door->boundingRect().height(),
@@ -397,7 +466,7 @@ bool GameView::tryMovePlayer(const QPointF &delta)
                 }
             }
 
-            // Remove the key from scene
+            spawnMonsters(4);
             m_scene->removeItem(item);
             delete item;
         } else if (tag == "exit") {
@@ -413,12 +482,305 @@ bool GameView::tryMovePlayer(const QPointF &delta)
     centerOn(m_player);
 
     if (reachedExit) {
+        for (MonsterItem *m : m_monsters) {
+            if (m) {
+                m_scene->removeItem(m);
+                delete m;
+            }
+        }
+        m_monsters.clear();
+
         loadNextLevel();
         viewport()->update();
     }
 
     return true;
 }
+
+void GameView::spawnMonsters(int count)
+{
+    if (m_walkableCells.isEmpty())
+        return;
+
+    QString base = QCoreApplication::applicationDirPath();
+
+    // Two kinds of monster textures
+    QPixmap damagePix(base + "/monsters/damage.png"); // Damage monster
+    QPixmap slowPix(base + "/monsters/slow.png");     // Slow monster
+
+    if (damagePix.isNull() || slowPix.isNull()) {
+        qWarning() << "[GameView] Monster textures not found under"
+                   << base + "/monsters";
+    }
+
+    for (int i = 0; i < count; ++i) {
+        int idx = QRandomGenerator::global()->bounded(m_walkableCells.size());
+        QPoint cell = m_walkableCells[idx];
+
+        QPointF center(cell.x() * m_cellSize + m_cellSize / 2.0,
+                       cell.y() * m_cellSize + m_cellSize / 2.0);
+
+        int r = QRandomGenerator::global()->bounded(100);
+        MonsterItem::MonsterType t =
+            (r < 30 ? MonsterItem::DamageMonster   // 30% damage monster
+                    : MonsterItem::SlowMonster);    // 70% slow monster
+
+        const QPixmap &pix = (t == MonsterItem::DamageMonster ? damagePix : slowPix);
+        if (pix.isNull())
+            continue;
+
+        MonsterItem *monster = new MonsterItem(t, pix, 100, m_cellSize);
+        m_scene->addItem(monster);
+
+        QRectF b = monster->boundingRect();
+        monster->setPos(center.x() - b.width() / 2.0,
+                        center.y() - b.height() / 2.0);
+
+        m_monsters.append(monster);
+    }
+}
+
+void GameView::updateMonsters()
+{
+    if (!m_player || m_monsters.isEmpty())
+        return;
+
+    QRectF pb = m_player->boundingRect();
+    QPointF playerCenter = m_player->pos() + QPointF(pb.width() / 2.0,
+                                                     pb.height());
+
+    qreal attackRadius = m_cellSize * 1.0;
+
+    // 30ms * 15 ≈ 450ms ≈ 0.5s per attack
+    const int ticksPerHit = 15;
+
+    for (int i = m_monsters.size() - 1; i >= 0; --i) {
+        MonsterItem* m = m_monsters[i];
+        if (!m) continue;
+
+        if (m->isDead()) {
+            m_scene->removeItem(m);
+            delete m;
+            m_lastAttackTick.remove(m);
+            m_touchingMonsters.remove(m);
+            m_monsters.removeAt(i);
+            continue;
+        }
+
+        QRectF mb = m->boundingRect();
+        QPointF monsterCenter = m->pos() + QPointF(mb.width()/2.0,
+                                                   mb.height());
+
+        QLineF line(monsterCenter, playerCenter);
+        qreal dist = line.length();
+
+        bool touching = (dist <= attackRadius);
+
+        // ---- Attack: when touching, damage approx every 0.5s ----
+        if (touching) {
+            int lastTick = m_lastAttackTick.value(m, -1000000);
+            if (m_tickCount - lastTick >= ticksPerHit) {
+                if (m->monsterType() == MonsterItem::DamageMonster)
+                    damagePlayer(10);
+                else
+                    applySlowToPlayer(1500, 0.5);  // 1.5s slow to 50%
+
+                m_lastAttackTick[m] = m_tickCount;
+            }
+
+            m_touchingMonsters.insert(m);
+            // When touching, monster stays still or moves minimally; do not chase
+            continue;
+        } else {
+            // Leaving contact resets cooldown
+            m_touchingMonsters.remove(m);
+        }
+
+        // ---- Random decision: chase player or wander ----
+        bool chase = (QRandomGenerator::global()->bounded(100) < 85);
+
+        QPointF delta(0, 0);
+        qreal step = m->speed();
+
+        if (chase && dist > 0.1) {
+            // Normal chase
+            line.setLength(step);
+            delta = QPointF(line.dx(), line.dy());
+        } else {
+            // Random direction
+            int angleDeg = QRandomGenerator::global()->bounded(360);
+            qreal rad = angleDeg * (3.14159265 / 180.0);
+            delta = QPointF(std::cos(rad) * step,
+                            std::sin(rad) * step);
+        }
+
+        // ---- Small noisy jitter (to avoid synchronized movement) ----
+        qreal noiseX = (QRandomGenerator::global()->bounded(100) - 50) / 200.0;
+        qreal noiseY = (QRandomGenerator::global()->bounded(100) - 50) / 200.0;
+        delta += QPointF(noiseX, noiseY);
+
+        // ---- Repulsion (prevent crowding) ----
+        for (MonsterItem* other : m_monsters) {
+            if (other == m) continue;
+
+            QRectF ob = other->boundingRect();
+            QPointF otherCenter = other->pos() + QPointF(ob.width()/2.0,
+                                                         ob.height()/2.0);
+
+            qreal d = QLineF(monsterCenter, otherCenter).length();
+            if (d < (m_cellSize * 1.1) && d > 0.01) {
+                QPointF diff = monsterCenter - otherCenter;
+                diff /= d;
+                delta += diff * 0.4;   // strength of repulsion
+            }
+        }
+
+        m->setPos(m->pos() + delta);
+    }
+
+    // Remove attack records of monsters that no longer exist
+    for (auto it = m_lastAttackTick.begin(); it != m_lastAttackTick.end(); ) {
+        if (!m_monsters.contains(it.key()))
+            it = m_lastAttackTick.erase(it);
+        else
+            ++it;
+    }
+}
+
+void GameView::damagePlayer(int amount)
+{
+    m_playerHp -= amount;
+    if (m_playerHp < 0)
+        m_playerHp = 0;
+
+    qDebug() << "[GameView] Player HP:" << m_playerHp << "/" << m_playerMaxHp;
+
+    if (m_playerHp <= 0) {
+        // Simple handling: stop movement & play death action
+        m_moveTimer.stop();
+        m_monsterAITimer.stop();
+        m_controller.setStep(0);
+        m_player->setAction(PlayerItem::Dying);
+        QTimer::singleShot(6000, this, [](){
+            QApplication::quit();  // Quit whole program
+        });
+    }
+}
+
+void GameView::applySlowToPlayer(int durationMs, qreal factor)
+{
+    if (m_playerSlowed)
+        return;
+
+    m_playerSlowed = true;
+
+    int originalStep = m_step;
+    int slowedStep   = qMax(1, int(originalStep * factor));
+    m_controller.setStep(slowedStep);
+
+    // Restore speed after duration
+    QTimer::singleShot(durationMs, this, [this, originalStep]() {
+        m_controller.setStep(originalStep);
+        m_playerSlowed = false;
+    });
+}
+
+void GameView::resolvePlayerAttack()
+{
+    if (!m_player)
+        return;
+
+    QRectF spriteLocal = m_player->boundingRect();
+    QPointF bottomCenterLocal(
+        spriteLocal.center().x(),
+        spriteLocal.bottom()
+        );
+    QPointF bottomCenterScene = m_player->mapToScene(bottomCenterLocal);
+
+    QRectF attackRect;
+    qreal w = m_cellSize;
+    qreal h = m_cellSize;
+
+    switch (m_player->direction()) {
+    case PlayerItem::Front:
+        attackRect = QRectF(bottomCenterScene.x() - w/2.0,
+                            bottomCenterScene.y(),
+                            w, h);
+        break;
+    case PlayerItem::Back:
+        attackRect = QRectF(bottomCenterScene.x() - w/2.0,
+                            bottomCenterScene.y() - h,
+                            w, h);
+        break;
+    case PlayerItem::Left:
+        attackRect = QRectF(bottomCenterScene.x() - w,
+                            bottomCenterScene.y() - h/2.0,
+                            w, h);
+        break;
+    case PlayerItem::Right:
+        attackRect = QRectF(bottomCenterScene.x(),
+                            bottomCenterScene.y() - h/2.0,
+                            w, h);
+        break;
+    }
+
+    QPainterPath path;
+    path.addRect(attackRect);
+
+    QList<QGraphicsItem*> items = m_scene->items(
+        path,
+        Qt::IntersectsItemShape,
+        Qt::DescendingOrder,
+        QTransform()
+        );
+
+    // Attack only the closest monster
+    MonsterItem* closest = nullptr;
+    qreal bestDist = 1e9;
+
+    QPointF playerCenter = m_player->mapToScene(spriteLocal.center());
+
+    for (QGraphicsItem *item : items) {
+        auto *monster = dynamic_cast<MonsterItem*>(item);
+        if (monster) {
+            QRectF mb = monster->boundingRect();
+            QPointF mc = monster->pos() + QPointF(mb.width()/2.0, mb.height()/2.0);
+
+            qreal d = QLineF(playerCenter, mc).length();
+            if (d < bestDist) {
+                bestDist = d;
+                closest = monster;
+            }
+        }
+    }
+
+    if (closest) {
+        closest->takeDamage(40);
+    }
+}
+
+// ---- Monster collision check: is the target position a wall? ----
+bool GameView::monsterCanMoveTo(const QPointF &pos)
+{
+    if (m_grid.empty())
+        return false;
+
+    int col = static_cast<int>(pos.x() / m_cellSize);
+    int row = static_cast<int>(pos.y() / m_cellSize);
+
+    if (row < 0 || col < 0)
+        return false;
+
+    int rows = static_cast<int>(m_grid.size());
+    int cols = static_cast<int>(m_grid[0].size());
+
+    if (row >= rows || col >= cols)
+        return false;
+
+    // 1 means wall; non-wall is walkable
+    return (m_grid[row][col] != 1);
+}
+
 void GameView::resizeEvent(QResizeEvent *event)
 {
     QGraphicsView::resizeEvent(event);

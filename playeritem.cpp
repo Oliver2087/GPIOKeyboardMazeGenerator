@@ -59,7 +59,7 @@ QVector<QPixmap> PlayerItem::loadFrames(const QString &folder)
     dir.setNameFilters(QStringList() << "*.png" << "*.PNG");
     dir.setSorting(QDir::Name | QDir::IgnoreCase);
 
-    QStringList files = dir.entryList();
+    const QStringList files = dir.entryList();
     for (const QString &file : files) {
         QString path = folder + "/" + file;
         QPixmap pix(path);
