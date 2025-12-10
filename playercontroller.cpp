@@ -40,6 +40,11 @@ bool PlayerController::handleKeyPress(QKeyEvent *event)
     if (!m_player)
         return false;
 
+    if (m_player->action() == PlayerItem::Dying) {
+        event->ignore();
+        return true;    // we consumed it, but no movement
+    }
+
     if (event->isAutoRepeat()) {
         event->ignore();
         return true;
@@ -93,6 +98,11 @@ bool PlayerController::handleKeyRelease(QKeyEvent *event)
 {
     if (!m_player)
         return false;
+
+    if (m_player->action() == PlayerItem::Dying) {
+        event->ignore();
+        return true;
+    }
 
     if (event->isAutoRepeat()) {
         event->ignore();

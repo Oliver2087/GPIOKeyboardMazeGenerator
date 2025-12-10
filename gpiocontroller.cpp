@@ -16,7 +16,9 @@ GpioController::GpioController(int step, QObject *parent)
     m_gpioLeft(-1),
     m_gpioRight(-1),
     m_gpioUp(-1),
-    m_gpioDown(-1)
+    m_gpioDown(-1),
+    m_gpioAttack(-1),
+    m_attackPrev(false)
 {
     // poll GPIO at 50 Hz
     m_pollTimer.setInterval(20);
@@ -47,12 +49,13 @@ void GpioController::reset()
         m_player->setAction(PlayerItem::Idle);
 }
 
-void GpioController::setGpios(int left, int right, int up, int down)
+void GpioController::setGpios(int left, int right, int up, int down, int attack)
 {
-    m_gpioLeft  = left;
-    m_gpioRight = right;
-    m_gpioUp    = up;
-    m_gpioDown  = down;
+    m_gpioLeft    = left;
+    m_gpioRight   = right;
+    m_gpioUp      = up;
+    m_gpioDown    = down;
+    m_gpioAttack  = attack;
 }
 
 // We keep these for interface compatibility with PlayerController,
@@ -92,10 +95,11 @@ bool GpioController::readGpio(int gpio) const
 void GpioController::pollInputs()
 {
     // Update movement booleans from GPIO pins
-    bool left  = readGpio(m_gpioLeft);
-    bool right = readGpio(m_gpioRight);
-    bool up    = readGpio(m_gpioUp);
-    bool down  = readGpio(m_gpioDown);
+    bool left   = readGpio(m_gpioLeft);
+    bool right  = readGpio(m_gpioRight);
+    bool up     = readGpio(m_gpioUp);
+    bool down   = readGpio(m_gpioDown);
+    bool attack = readGpio(m_gpioAttack);
 
     m_moveLeft  = left;
     m_moveRight = right;
@@ -104,6 +108,26 @@ void GpioController::pollInputs()
 
     if (!m_player)
         return;
+
+    // ======== ATTACK BUTTON: on rising edge ========
+    if (attack && !m_attackPrev) {
+        // Only allow attack if not dying
+        if (m_player->action() != PlayerItem::Dying) {
+            m_player->setAction(PlayerItem::Attack);
+            emit attackTriggered();  // GameView will handle resolvePlayerAttack()
+        }
+    }
+    m_attackPrev = attack;
+    // ===============================================
+
+    // If dying: freeze movement & DO NOT change animation anymore
+    if (m_player->action() == PlayerItem::Dying) {
+        m_moveLeft  = false;
+        m_moveRight = false;
+        m_moveUp    = false;
+        m_moveDown  = false;
+        return;
+    }
 
     // Set direction & animation based on active movement
     if (isMoving()) {
@@ -117,9 +141,17 @@ void GpioController::pollInputs()
         } else if (m_moveDown) {
             m_player->setDirection(PlayerItem::Front);
         }
-        m_player->setAction(PlayerItem::Run);
+
+        // IMPORTANT: do NOT override Attack animation
+        if (m_player->action() != PlayerItem::Attack) {
+            m_player->setAction(PlayerItem::Run);
+        }
     } else {
-        m_player->setAction(PlayerItem::Idle);
+        // No movement: only go Idle if not attacking
+        if (m_player->action() != PlayerItem::Attack &&
+            m_player->action() != PlayerItem::Dying) {
+            m_player->setAction(PlayerItem::Idle);
+        }
     }
 }
 
@@ -128,6 +160,9 @@ QPointF GpioController::movementDelta() const
     QPointF delta(0, 0);
 
     if (!m_player)
+        return delta;
+
+    if (m_player->action() == PlayerItem::Dying)
         return delta;
 
     if (m_moveLeft)  delta.rx() -= m_step;

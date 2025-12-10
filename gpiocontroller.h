@@ -28,7 +28,10 @@ public:
     bool isMoving() const;
 
     // Extra: configure which GPIOs map to directions
-    void setGpios(int left, int right, int up, int down);
+    void setGpios(int left, int right, int up, int down, int attack = -1);
+
+signals:
+    void attackTriggered();
 
 private slots:
     void pollInputs();
@@ -51,6 +54,9 @@ private:
     int m_gpioRight;
     int m_gpioUp;
     int m_gpioDown;
+    int m_gpioAttack;
+
+    bool m_attackPrev;
 
     QTimer m_pollTimer;
 };
